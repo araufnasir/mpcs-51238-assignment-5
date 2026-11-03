@@ -1,20 +1,26 @@
 import { auth } from "@clerk/nextjs/server";
 import { FollowButton } from "@/components/live/FollowButton";
 import { LiveStations, type LiveStation, type Run } from "@/components/live/LiveStations";
+import { StationSearchForm } from "@/components/live/StationSearchForm";
 import { RetryButton } from "@/components/RetryButton";
 import { StateMessage } from "@/components/StateMessage";
-import { primaryButton } from "@/components/buttons";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 
 const STATION_COLUMNS =
   "station_id, name, num_bikes_available, num_ebikes_available, num_docks_available, is_renting, is_reporting, last_reported, updated_at";
 const RUN_COLUMNS = "id, finished_at, ok, rows_changed, feed_last_updated, error";
 const SEARCH_LIMIT = 15;
+const MAX_WORDS = 5;
+
+// Escape ilike wildcards so a typed % or _ matches literally.
+const escapeLike = (word: string) => word.replace(/[\\%_]/g, (c) => `\\${c}`);
 
 export default async function LivePage({ searchParams }: PageProps<"/live">) {
   await auth.protect();
   const { q } = await searchParams;
   const query = (typeof q === "string" ? q : "").trim().slice(0, 100);
+  // Each word must appear somewhere in the name, so "59th university" finds "University Ave & 59th St".
+  const words = query.split(/\s+/).filter(Boolean).slice(0, MAX_WORDS);
 
   const supabase = await createServerSupabaseClient();
   // RLS returns only the signed-in user's follows.
@@ -25,16 +31,16 @@ export default async function LivePage({ searchParams }: PageProps<"/live">) {
   ]);
 
   // Only stations that reported in the last 24 h are offered, so nobody follows a dead one.
-  const search = query
-    ? await supabase
-        .from("stations")
-        .select("station_id, name, num_bikes_available, num_docks_available")
-        .eq("is_reporting", true)
-        .eq("is_installed", true)
-        .ilike("name", `%${query.replace(/[\\%_]/g, (c) => `\\${c}`)}%`)
-        .order("name")
-        .limit(SEARCH_LIMIT)
-    : null;
+  let search = null;
+  if (words.length > 0) {
+    let stationQuery = supabase
+      .from("stations")
+      .select("station_id, name, num_bikes_available, num_docks_available")
+      .eq("is_reporting", true)
+      .eq("is_installed", true);
+    for (const word of words) stationQuery = stationQuery.ilike("name", `%${escapeLike(word)}%`);
+    search = await stationQuery.order("name").limit(SEARCH_LIMIT);
+  }
 
   if (follows.error || latestRun.error || lastOkRun.error) {
     return (
@@ -68,20 +74,7 @@ export default async function LivePage({ searchParams }: PageProps<"/live">) {
 
       <section aria-labelledby="search-heading" className="space-y-3">
         <h2 id="search-heading" className="text-lg font-semibold">Find a station</h2>
-        <form role="search" action="/live" className="flex gap-2">
-          <label htmlFor="station-q" className="sr-only">Station name</label>
-          <input
-            id="station-q"
-            name="q"
-            defaultValue={query}
-            placeholder="e.g. Clinton St"
-            maxLength={100}
-            className="min-w-0 flex-1 rounded-lg border border-zinc-300 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-600 dark:border-zinc-700 dark:bg-zinc-900"
-          />
-          <button type="submit" className={`${primaryButton} focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-600`}>
-            Search
-          </button>
-        </form>
+        <StationSearchForm query={query} />
 
         {search?.error && (
           <StateMessage tone="error" icon="⚠️" title="Search failed" action={<RetryButton />}>
@@ -89,8 +82,9 @@ export default async function LivePage({ searchParams }: PageProps<"/live">) {
           </StateMessage>
         )}
         {search?.data && search.data.length === 0 && (
-          <StateMessage icon="🔍" title="No active stations match">
-            Only stations that reported in the last 24 hours are listed.
+          <StateMessage icon="🔍" title={`No stations match ‘${query}’`}>
+            Station names are street intersections, so try ‘university’, ‘canal’ or ‘clinton’. Only stations that
+            reported in the last 24 hours are listed.
           </StateMessage>
         )}
         {search?.data && search.data.length > 0 && (
