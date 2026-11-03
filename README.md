@@ -1,14 +1,10 @@
-# Weather Watchlist
+# Live Divvy
 
-A small web app for keeping an eye on the weather in the cities you care about. Sign in, search for a city, save it to your list, and see the current temperature, conditions, and today's high and low for every saved city. Each person sees only their own list, and it's still there the next time they sign in.
+A live tracker for Chicago's Divvy bike stations. Each signed-in user follows the stations they care about, and `/live` shows their bikes, e-bikes and open docks changing on their own, with no refreshing, plus how fresh the data is. The weather watchlist from Assignment 4 is still there as a secondary page (**Weather** in the nav).
 
-Built for MPCS 51238 Assignment 4 with Next.js 16, Clerk, Supabase and [Open-Meteo](https://open-meteo.com/).
+Built for MPCS 51238 Assignment 5 with Next.js 16, Clerk, Supabase (Postgres, Edge Functions, Cron, Vault, Realtime) and Divvy's public [GBFS feed](https://gbfs.lyft.com/gbfs/2.3/chi/gbfs.json). The source measurements are in [`docs/source.md`](docs/source.md), the design written before any code is in [`docs/data-flow.md`](docs/data-flow.md), and Q&A notes are in [`docs/notes.md`](docs/notes.md).
 
-## Assignment 5: live Divvy stations (`/live`)
-
-Signed-in users follow Divvy bike stations and watch their bike and dock counts update without refreshing. A Supabase Edge Function, called by Supabase Cron every 60 seconds, pulls Divvy's public GBFS feed and saves only the stations that changed. Supabase Realtime pushes those changes to the page. The weather watchlist below still works as before.
-
-Every 60 seconds because the feed refreshes every 60 s: `station_status` advertises `ttl: 60`, and its `last_updated` moved by about 60 s on every fetch. Polling faster re-reads the same snapshot, and polling slower skips some. That is 43,200 function calls a month, about 9% of the free 500,000.
+## Data flow
 
 ```mermaid
 flowchart LR
@@ -17,7 +13,7 @@ flowchart LR
     subgraph Supabase
         VAULT[("Vault")]
         CRON["Supabase Cron<br/>every 60 s"]
-        EF["Edge Function<br/>divvy-sync<br/>pure core: diff()"]
+        EF["Edge Function<br/>divvy-sync<br/>pure core: planRun()"]
         ST[("stations<br/>read: signed-in users<br/>write: worker only")]
         RUNS[("runs<br/>one row per run")]
         FOL[("followed_stations<br/>RLS: user_id = Clerk sub")]
@@ -27,8 +23,8 @@ flowchart LR
     NX["Next.js on Vercel<br/>/live first render<br/>follow / unfollow"]
     BR["Browser /live<br/>freshness + 4 states"]
 
-    VAULT -. "secret by name" .-> CRON
-    CRON -- "1 POST, Authorization from Vault" --> EF
+    VAULT -. "secret, read by name" .-> CRON
+    CRON -- "1 POST + x-divvy-sync-secret" --> EF
     DIVVY -- "2 JSON: stations[], last_updated,<br/>names, lat/lon, capacity" --> EF
     EF -- "3-4 read current, upsert<br/>ONLY changed rows (~80/min)" --> ST
     EF -- "5 insert: when, ok, rows_changed,<br/>feed_last_updated, error" --> RUNS
@@ -37,182 +33,124 @@ flowchart LR
     RT -- "7 my followed stations only<br/>+ new runs, RLS via Clerk JWT" --> BR
     BR -- "follow / unfollow (Clerk JWT)" --> NX
     NX -- "insert / delete my row" --> FOL
-    NX -- "my follows + stations + latest run" --> BR
+    NX -- "my follows + stations + latest runs" --> BR
 ```
 
-Details: what each hop sends, the freshness rules, the four page states and the Realtime volume estimate are in [`docs/data-flow.md`](docs/data-flow.md). The source measurements are in [`docs/source.md`](docs/source.md).
+| # | from → to | what is sent |
+|---|-----------|--------------|
+| 1 | Cron → Edge Function | An HTTPS POST every minute, with header `x-divvy-sync-secret`. Its value is read from Vault by name when the job runs. |
+| 2 | Divvy → Edge Function | Two JSON responses. `station_status` has counts, flags, each station's `last_reported` and the feed's `last_updated`. `station_information` has name, coordinates and capacity. |
+| 3–4 | Edge Function → `stations` | Reads the compared columns of all rows, 1,000 at a time. Then upserts only the stations that changed, on `station_id`. |
+| 5 | Edge Function → `runs` | One row per run, success or failure: `started_at`, `finished_at`, `ok`, `rows_changed`, `feed_last_updated`, `error`. |
+| 6 | Postgres → Realtime | Committed changes to `stations` and `runs`, through the `supabase_realtime` publication. |
+| 7 | Realtime → browser | `postgres_changes` for `stations`, filtered to `station_id=in.(my follows)`, plus `runs` inserts. Each event is checked against RLS with the user's Clerk token. |
+| – | Browser ↔ Next.js ↔ Postgres | Follow and unfollow are server actions using the user's Clerk token, with RLS on `followed_stations`. The first render reads the user's follows, their station rows, the latest run and the latest successful run. |
 
-## Data model
+## Why every 60 seconds
 
-One table, `public.saved_cities`. Each row belongs to exactly one person: `user_id` is their Clerk user ID, filled in from their session token.
+`station_status` advertises `ttl: 60`, and its `last_updated` moved by about 60 s between every pair of fetches. Polling faster would mostly fetch the same snapshot again. Polling slower would skip snapshots.
 
-```mermaid
-erDiagram
-    CLERK_USER ||--o{ SAVED_CITIES : "saves (0–50)"
-    CLERK_USER {
-        text id "user_… (lives in Clerk, not in Postgres)"
-    }
-    SAVED_CITIES {
-        uuid id PK
-        text user_id "default auth.jwt()->>'sub'"
-        text name "1–200 chars"
-        float8 latitude "-90..90"
-        float8 longitude "-180..180"
-        timestamptz created_at
-    }
-```
+Free-tier math (Supabase Free):
 
-- `unique (user_id, latitude, longitude)` stops the same city being saved twice.
-- Check constraints and a `before insert` trigger (max 50 per user) enforce the input rules in the database, because signed-in users can call Supabase directly with their own token.
-- Weather is **not** stored. It's fetched when the watchlist is viewed.
-- Migrations are in [`supabase/migrations/`](supabase/migrations/).
+| | per month | free quota | share |
+|---|---|---|---|
+| Edge Function calls (1 per minute) | 60 × 24 × 30 = **43,200** | 500,000 | ~9% |
+| Realtime: `runs` events, 5 pages open 24/7 | 5 × 43,200 = 216,000 | 2,000,000 | |
+| Realtime: station events, 5 pages × 10 follows | 84k at the average change rate (~4% of stations per minute), 324k if all follows are busy stations | | |
+| **Realtime total, worst case** | **about 540,000** | 2,000,000 | ~27% |
 
-## Request flow: saving a city
+An unfiltered `stations` subscription would be about 80 events × 43,200 minutes × 5 pages ≈ 17 M a month, so the page always filters to the user's follows. Realtime's `in` filter takes at most 100 values, and a trigger caps follows at 50 per user.
 
-```mermaid
-sequenceDiagram
-    actor U as User (browser)
-    participant S as Next.js server
-    participant C as Clerk
-    participant DB as Supabase (Postgres + RLS)
-    participant OM as Open-Meteo
+## What counts as a change
 
-    U->>S: type "reyk" (debounced 300 ms) → GET /api/geocode?q=reyk
-    S->>C: auth.protect(): who is this?
-    S->>OM: geocoding search (cached for days)
-    OM-->>S: matching places
-    S-->>U: results list
-    U->>S: tap "Reykjavík" → saveCity server action
-    S->>C: auth.protect(), getToken()
-    C-->>S: session JWT (sub = user_…)
-    S->>DB: insert {name, lat, lon} with the JWT
-    DB->>DB: user_id := jwt.sub, RLS with check, constraints, 50-city trigger
-    DB-->>S: ok
-    S-->>U: "✓ Saved" (page refreshed)
-    Note over U,OM: Later, on /watchlist
-    U->>S: GET /watchlist
-    S->>DB: select saved cities (RLS: only this user's rows)
-    S->>OM: one forecast request for all cities (cached 10 min)
-    S-->>U: cards with temperature, conditions, high/low
-```
+A station is rewritten only when its **counts or flags** change: bikes, e-bikes, docks, disabled bikes and docks, `is_installed`, `is_renting`, `is_returning`, and the derived `is_reporting`. Its info (name, coordinates, capacity) also counts, so renamed or new stations are saved. **`last_reported` never counts.** In the measured fetches, about 700–800 stations bumped `last_reported` each minute, but only about 70–90 had a real change (80 on average across the runs since the coordinate fix). Counting heartbeats would rewrite a third of the table every minute and send a Realtime event for each row.
 
-## Where the API call happens, and why
+`is_reporting` is false when a station hasn't reported for over 24 h, measured against the feed's own clock. A station going silent is written once, when it crosses 24 h. The station search only offers stations that are reporting and installed.
 
-All Open-Meteo calls run **on the server**: search goes through `app/api/geocode/route.ts`, and the watchlist page fetches weather itself. The code is in [`lib/open-meteo.ts`](lib/open-meteo.ts).
+## Freshness
 
-- **Caching.** Results are cached with `use cache`: geocoding for days, weather for 10 minutes. This keeps the app well under Open-Meteo's free limits.
-- **One place for the API-down state.** Every call has a 5-second timeout and checks the HTTP status. Any failure turns into one clear "service down" message with a Retry button. Failures are never cached, so Retry really tries again.
-- **No key, but errors still handled.** Open-Meteo needs no API key, so this isn't about hiding a secret. It's about consistent error handling and caching. The response quirks are handled in one place: no matches come back as `200` with no `results` key, and one location returns an object while several return an array.
+The page shows two clocks:
 
-## Recommendations
+- **Worker updated N s ago:** `finished_at` of the latest successful run.
+- **Divvy feed published N s ago:** the feed's own `last_updated` as seen by that run.
 
-Each city card has **Wear / Bring / Ideas**, and the top of `/watchlist` has a **Today's brief**: one line per city on what to wear, plus the best saved city for outdoor plans today. They come from rules only, in [`lib/recommendations.ts`](lib/recommendations.ts): pure functions with no AI model, no new tables and no user data. The inputs are the public forecast: feels-like, conditions, day or night, today's high and low, rain chance, wind and UV.
+A run that changes 0 rows still inserts a `runs` row, which reaches the page over Realtime. So a quiet minute doesn't look stale.
 
-- **Wear** follows feels-like temperature: from "Heavy coat, hat, gloves and scarf" (≤ −10 °C) to "Light, breathable clothes" (> 26 °C), plus boots in snow.
-- **Bring:**
-  - An umbrella if rain chance is ≥ 60% or it's raining. A hooded jacket instead if wind is ≥ 40 km/h.
-  - A compact umbrella at 30–59%.
-  - A windproof layer at ≥ 30 km/h.
-  - Sunscreen at UV ≥ 3, plus sunglasses and a hat at UV ≥ 6.
-  - An extra layer if the day spans 10 °C or more.
-- **Ideas:** 2–3 outdoor and indoor picks.
-  - Storms remove outdoor ideas, and nights switch to evening ideas.
-  - If it's raining now, the idea is a walk between showers. If it's dry now but showers are likely later, it's "Get outside now, before the showers".
-- **Best for outdoor plans:** a 0–100 score that starts at 100 and loses points for rain chance, distance of today's high from 21 °C, wind above 20 km/h, storms and very high UV. Below 40 everywhere, the brief suggests an indoor day.
+| state | when | what the user sees |
+|-------|------|--------------------|
+| **loading** | the route is loading, the Realtime channel isn't subscribed yet, or no successful run is known | skeleton cards, then ⏳ "Connecting to live updates…" |
+| **fresh** | both clocks are 3 minutes old or less | ✅ "Live" |
+| **stale** | either clock is over 3 minutes (about three missed runs) | ⚠️ banner and dimmed cards. It names the worker if the worker clock is behind, otherwise Divvy ("hasn't published new data…; the worker is still running") |
+| **down** | the latest run has `ok = false` | ⛔ banner with the run's age and error. The last known counts stay visible with their age. |
 
-The rules work in metric and their text contains no numbers. The **°F (default) / °C toggle** therefore converts only for display, in the browser, and is remembered in `localStorage`. Forecasts stay cached by coordinates alone, never by user or unit.
+A stopped worker ages both clocks, because the feed time is only seen through runs, so the stale case blames the worker first. Each state has an icon and text, not just a colour. State changes are announced with `aria-live="polite"`, and the ticking seconds are not. The logic lives in [`lib/freshness.ts`](lib/freshness.ts).
 
-`e2e/recommendations.spec.ts` checks hand-computed examples (hot sunny day, raining now, snowy night, mild but windy, dry now with showers later, thunderstorm, best city) without signing in: `npx playwright test e2e/recommendations.spec.ts`.
+## The worker
 
-## Access control
+- **Supabase Edge Function** [`supabase/functions/divvy-sync`](supabase/functions/divvy-sync). [`core.ts`](supabase/functions/divvy-sync/core.ts) is pure (`planRun(current, status, info)`). [`index.ts`](supabase/functions/divvy-sync/index.ts) does the fetching and writing.
+- **Supabase Cron** job `divvy-sync-every-minute` (`* * * * *`) POSTs to it through `pg_net`.
+- **Shared secret:** generated inside Postgres into Vault as `divvy_sync_cron_secret`. Only its name appears in the repo. The function is deployed with `verify_jwt = false` and checks the header itself by calling `divvy_sync_secret_ok()`, a database function only the service role can execute. A missing or wrong secret gets `401` and writes nothing. That was tested with no header, a wrong header, and a GET (`405`).
+- The function talks to the database with the **secret key Supabase injects** into its environment (`SUPABASE_SECRET_KEYS`), never a key in code.
+- Every run, successful or not, inserts a row into **`runs`**. Its log line lists how many rows changed per field, for example `fields={"num_bikes_available":48,"num_docks_available":57,...}`.
 
-- **Who you are: Clerk.** On the server, `auth()` / `auth.protect()` from `@clerk/nextjs/server` reads the Clerk session. Every page, route handler and server action that touches data calls `auth.protect()`. Signed-out visitors are sent to sign-in (pages) or get a 404 (API and actions). The home and sign-in/up pages show no data.
-- **What you can see: RLS in Postgres.** The Supabase client ([`lib/supabase/server.ts`](lib/supabase/server.ts)) forwards the Clerk session token through supabase-js `accessToken`. Supabase verifies it (Clerk is set up as a third-party auth provider). Then the row-level security policies on `saved_cities` compare `(select auth.jwt()) ->> 'sub'` with `user_id`, for SELECT, INSERT (`with check`) and DELETE. There's no UPDATE policy, so updates are denied, and signed-out (`anon`) requests have no policies at all. Even if the app code forgot a filter, Postgres would still return only your rows.
+## Realtime: three requirements, and what breaks silently
 
-## Testing
+A Realtime `postgres_changes` subscription needs all three of these. If any one is missing, nothing errors: the channel still reports `SUBSCRIBED`, and the page just freezes.
 
-`e2e/watchlist-isolation.spec.ts` is one Playwright test that uses two real Clerk test users (`@clerk/testing`):
-
-1. User A signs in, searches "Reykjavik", and saves it. The test confirms the row has A's `user_id`.
-2. User B signs in separately and opens `/watchlist`. Reykjavík must **not** appear.
-3. B's own Clerk token is used to query Supabase directly. Fetching A's row by `id`, or any row with a different `user_id`, must return `[]`.
-4. A's row is deleted afterwards.
-
-**Proving it works.** I temporarily added this policy through the Supabase MCP. It was never a migration and never committed:
-
-```sql
-create policy "TEMP BROKEN - anyone can read every row"
-  on public.saved_cities for select to authenticated using (true);
-```
-
-Postgres combines policies with OR, so every signed-in user could now read every row. The test failed on both checks:
-
-```
-✘  1 [chromium] › e2e/watchlist-isolation.spec.ts:40:5 › user B cannot see user A's saved city (15.6s)
-  Error: A's city on B's watchlist
-  expect(locator).toHaveCount(expected) failed
-  Locator:  getByRole('heading', { name: /Reykjav[ií]k/ })
-  Expected: 0
-  Received: 1
-
-  Error: B fetched A's row by id
-  expect(received).toEqual(expected) // deep equality
-  - Array []
-  + Array [
-  +   Object {
-  +     "id": "e3cf2d61-1e82-4393-85ef-8258153b379d",
-  +   },
-  + ]
-  1 failed
-```
-
-**Fix:** dropped the broken policy. Only the three migration policies remain, the Supabase security advisor reports no findings, and the test passes again.
-
-Two decisions in the test:
-- Sign-in uses `clerk.signIn({ emailAddress })`, which creates a one-time token through Clerk's backend. The password strategy stops at Clerk's `needs_client_trust` step, because every Playwright browser counts as a new device.
-- The watchlist check is a soft assertion, so the direct-Supabase checks still run and report when it fails.
-
-## Security review
-
-`/security-review` on `feature/watchlist` found **no vulnerabilities at 8/10 confidence or higher**. A full git-history search for key patterns found no keys. The only hit was an npm `sha512-` integrity hash that happens to contain "eyJ". `npm audit --omit=dev` reports 0 vulnerabilities.
-
-Lower-confidence observations, and what I did about each:
-
-| Observation | Matters for a class app on free tiers? | Action |
+| requirement | where | if missing |
 |---|---|---|
-| Signed-in users can call Supabase directly with their own token, skipping the server action's input checks | Yes. Someone could store junk or huge values in their own rows | **Fixed:** check constraints (name length, lat/lon ranges) in a migration |
-| No limit on how many cities one user can save | Yes. Unbounded rows would eat the 500 MB database, and one batched forecast URL per watchlist would grow without limit | **Fixed:** `before insert` trigger caps each user at 50; the watchlist query is limited to 50 |
-| App could be framed by another site (clickjacking on Save/Remove) | A little. Cheap to prevent | **Fixed:** `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `nosniff`, referrer policy; removed `X-Powered-By` |
-| No rate limit on `/api/geocode` | A little. Only signed-in users can call it, results are cached per query, and Open-Meteo limits are per IP | **Not fixed:** reliable rate limiting on serverless needs a shared store (new service or package) |
-| No full Content-Security-Policy | Low. React escapes output and there's no `dangerouslySetInnerHTML` | **Not fixed:** a full CSP that works with Clerk needs nonces on every page |
-| Error messages | No. Responses are already generic; Supabase and Open-Meteo errors are never sent to the browser | No change |
-| Search input limits | No. Already 2–100 characters, checked on the server | No change |
+| the table is in the `supabase_realtime` publication | `alter publication supabase_realtime add table …` | Postgres never sends the change to Realtime, so no events at all |
+| `grant select … to authenticated` | the migrations | Realtime can't read the row as the subscriber's role, so the event is dropped |
+| an RLS `select` policy for `authenticated` | the migrations | RLS filters every row out for that user, so the event is dropped |
+
+All three are in the migrations for both `stations` and `runs`, and the catalog was checked after applying them.
+
+## Tests
+
+- **`npm run test:worker`** ([`core.test.ts`](supabase/functions/divvy-sync/core.test.ts)): runs the worker's decision logic on saved copies of two real `station_status` responses taken 60 s apart, trimmed to 7 stations, and checks exactly what it would save:
+  - only the stations whose counts changed, plus new ones, with the new values;
+  - a `last_reported`-only change saves nothing, and an identical response saves nothing;
+  - a flag change is saved;
+  - a station is flagged inactive once, when it passes 24 h;
+  - a station missing from `station_information` is skipped;
+  - a malformed response throws, so the run is recorded as failed;
+  - coordinates survive the database round trip (the bug below).
+- **`npm run test:freshness`** ([`lib/freshness.test.ts`](lib/freshness.test.ts)): loading, fresh, stale (which clock, including the 3-minute boundary), down, and that a failed run keeps the last successful one, so the counts keep their true age.
+- **`npm run test:e2e`**: the Assignment 4 Playwright test that user B can't see user A's saved city.
+
+### A bug found in the logs
+
+The first scheduled runs wrote 210–240 rows a minute, about 3× the measured change rate, and one run with an *unchanged* feed still wrote 148. With the per-field log added, the same **133 stations changed `lat`/`lon` on every run**. Some feed coordinates have 16–17 significant digits, but Supabase's REST API returns `double precision` with 15. For example, 63rd St Beach's latitude came back as `41.780910964248`. These values never compared equal to the feed, so those stations were rewritten every minute, and each rewrite was a Realtime event for anyone following them.
+
+**Fix:** round coordinates to 6 decimal places (about 11 cm) before saving and comparing. One run rewrote the rounded rows. In the 39 runs after that, the average was 80 rows and no log line has shown a `lat`/`lon` change. A regression test uses the real 17-digit value.
+
+The logs also show that Lyft's CDN sometimes serves the same snapshot twice. The run then writes **0** rows, and the next run covers two snapshots (up to about 170 rows, with the feed clock advancing 120 s).
 
 ## Free tiers
 
-| Service | Limits that could matter here | Usage limits and alerts |
+| service | limits that matter here | how to watch them |
 |---|---|---|
-| **Vercel Hobby** | Non-commercial personal use only. Per month: 1M function invocations, 4 h Active CPU, 360 GB-hrs provisioned memory, 100 GB Fast Data Transfer, 10 GB Fast Origin Transfer. Runtime logs kept 1 hour. | Hobby can't be charged. Usage notifications are automatic. Check **Dashboard → Usage** or run `vercel usage`. Spend Management (custom amount, pause projects) is Pro-only. |
-| **Supabase Free** | 500 MB database, 5 GB egress, 50,000 MAU, 2 active projects. **A free project is paused after 7 days without use**; restore it from the dashboard (data is kept). | The Free plan is never charged. Watch **Organization → Usage** (`supabase.com/dashboard/org/_/usage`). The Spend Cap is Pro-only. The 50-city cap keeps the table small. |
-| **Clerk Hobby** | **Development instances (what this app uses, including on Vercel) are capped at 100 users**, plus 100 Backend API requests per 10 s. Production Hobby allows 50,000 monthly retained users per app. | No billing on Hobby and no usage alerts. Check the user count in **Dashboard → Users**. Past 100 dev users, sign-ups stop working. |
-| **Open-Meteo** | Free for non-commercial use only: 600 calls/min, 5,000/hour, 10,000/day, 300,000/month, counted by IP and application. Shared hosts like Vercel can hit limits sooner. | No account or key, so there's no dashboard or alerts. Server-side caching (weather 10 min, geocoding days) and one batched request per watchlist keep calls low. If limited, the app shows its "service down" state. |
+| **Supabase Free** | 500,000 Edge Function calls a month (we use ~43k). 2 M Realtime messages and 200 concurrent connections. 500 MB database: `runs` grows by about 1,440 rows a day and `stations` stays at about 2,079 rows. **Projects with low activity over 7 days are paused** (a warning email comes first, and the project can be restored for 90 days). Whether cron traffic alone counts as enough activity isn't documented, so open the dashboard or use the app at least weekly. | Organization **Usage** page. The Free plan has no overage charges: going over quota triggers an email and a grace period. |
+| **Vercel Hobby** | Non-commercial use. Per month: 1 M function invocations, 1 M edge requests, 100 GB fast data transfer, 4 h active CPU. Going over pauses the feature until the 30-day window resets. | Project **Usage** tab. Spend management is a Pro feature, so on Hobby the limits are hard stops. |
+| **Clerk** (development instance) | The Free plan covers 50,000 monthly retained users per app. This app runs on a **development instance**, which is meant for development, not production traffic. | Clerk dashboard. Check your instance's user count there. |
+
+Sources: [Supabase Edge Function quota](https://supabase.com/docs/guides/platform/manage-your-usage/edge-function-invocations), [Realtime pricing](https://supabase.com/docs/guides/realtime/pricing), [Realtime limits](https://supabase.com/docs/guides/realtime/limits), [project pausing](https://supabase.com/docs/guides/platform/free-project-pausing), [Vercel Hobby](https://vercel.com/docs/plans/hobby), [Clerk pricing](https://clerk.com/pricing).
 
 ## Running locally
 
-1. `npm install`
-2. Create `.env.local`. It's git-ignored and Claude Code is denied read access in `.claude/settings.json`. It needs these **variable names** (values come from the Clerk and Supabase dashboards; never commit them):
-   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`: Clerk **development** instance
-   - `NEXT_PUBLIC_CLERK_SIGN_IN_URL`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL`: written by `clerk init`
-   - `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`
-   - For the e2e test: `E2E_USER_A_EMAIL`, `E2E_USER_B_EMAIL` (two users in the Clerk dev instance). `E2E_USER_A_PASSWORD` and `E2E_USER_B_PASSWORD` exist but aren't used by the current sign-in method.
-3. Supabase: apply the migrations in `supabase/migrations/` in order. Then connect Clerk as a third-party auth provider (Clerk Dashboard → Integrations → Supabase → Activate; Supabase → Authentication → Sign In / Providers → Third-Party Auth → Clerk).
-4. `npm run dev` and open http://localhost:3000
-5. Tests: `npx playwright install chromium` once, then `npm run test:e2e`
+Put these in `.env.local` (names only; get the values from the Supabase and Clerk dashboards, never commit them):
 
-## Designed states
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`
+- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
+- `CLERK_SECRET_KEY`
+- `E2E_USER_A_EMAIL`, `E2E_USER_B_EMAIL` (only for `npm run test:e2e`)
 
-| State | Search page | Watchlist page |
-|---|---|---|
-| **Loading** | Skeleton rows while a search is in flight (after the 300 ms debounce; older requests are cancelled) | `loading.tsx` skeleton cards while saved cities and weather load |
-| **Nothing found** | "No cities found for '…'", with a hint to check spelling | "No saved cities yet", with a button to search |
-| **API down** | "City search is down", with **Try again** | "Weather service is down", with **Try again**; saved cities stay listed and removable. A separate message covers a database error. |
+```bash
+npm install
+npm run dev               # http://localhost:3000; /live shows a dev-only Realtime status box
+npm run test:worker
+npm run test:freshness
+```
+
+The worker runs in Supabase, not locally. Its secret key comes from the Edge Function environment, and the cron secret lives only in Vault. Database changes are migrations in [`supabase/migrations/`](supabase/migrations/), and every table has RLS enabled with its policies in the same migration.
