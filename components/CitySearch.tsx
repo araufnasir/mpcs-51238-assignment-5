@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
+import Link from "next/link";
+import { useEffect, useRef, useState, useTransition } from "react";
 import { saveCity } from "@/app/actions";
 import { cityKey } from "@/lib/city-key";
 import type { CityResult } from "@/lib/open-meteo";
@@ -21,6 +22,11 @@ export function CitySearch({ savedKeys }: { savedKeys: string[] }) {
   const [saved, setSaved] = useState(() => new Set(savedKeys));
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // After a save the box is cleared for the next city, but the results stay
+  // on screen (with "✓ Saved") until the user types again.
+  const [savedName, setSavedName] = useState<string | null>(null);
+  const [keepResults, setKeepResults] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
   const [, startTransition] = useTransition();
 
   const trimmed = query.trim();
@@ -50,6 +56,7 @@ export function CitySearch({ savedKeys }: { savedKeys: string[] }) {
 
   function handleChange(value: string) {
     setQuery(value);
+    setKeepResults(false);
     const next = value.trim();
     // Only show loading if the effect will actually run a new search.
     if (next.length >= MIN_LENGTH && next !== trimmed) setStatus("loading");
@@ -64,10 +71,18 @@ export function CitySearch({ savedKeys }: { savedKeys: string[] }) {
     const key = cityKey(city);
     setSavingKey(key);
     setSaveError(null);
+    setSavedName(null);
     startTransition(async () => {
       const result = await saveCity({ name: city.name, latitude: city.latitude, longitude: city.longitude });
-      if (result.ok) setSaved((prev) => new Set(prev).add(key));
-      else setSaveError(result.error);
+      if (result.ok) {
+        setSaved((prev) => new Set(prev).add(key));
+        setSavedName(city.name);
+        setKeepResults(true);
+        setQuery("");
+        inputRef.current?.focus();
+      } else {
+        setSaveError(result.error);
+      }
       setSavingKey(null);
     });
   }
@@ -77,6 +92,7 @@ export function CitySearch({ savedKeys }: { savedKeys: string[] }) {
       <label className="block">
         <span className="sr-only">City name</span>
         <input
+          ref={inputRef}
           type="search"
           value={query}
           onChange={(e) => handleChange(e.target.value)}
@@ -90,7 +106,17 @@ export function CitySearch({ savedKeys }: { savedKeys: string[] }) {
 
       {saveError && <p role="alert" className="text-sm text-red-600 dark:text-red-400">{saveError}</p>}
 
-      {tooShort ? (
+      {/* Always rendered so screen readers announce the message when it appears. */}
+      <div role="status" className="text-sm">
+        {savedName && (
+          <p className="rounded-lg bg-green-50 px-3 py-2 text-green-800 dark:bg-green-950/40 dark:text-green-300">
+            Saved {savedName}.{" "}
+            <Link href="/watchlist" className="font-medium underline">View watchlist</Link>
+          </p>
+        )}
+      </div>
+
+      {tooShort && !keepResults ? (
         <p className="text-sm text-zinc-500">Type at least {MIN_LENGTH} letters to search.</p>
       ) : status === "loading" ? (
         <ul aria-label="Searching" aria-busy className="space-y-2">
