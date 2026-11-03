@@ -56,7 +56,7 @@ Deno.serve(async (req) => {
     console.log(
       `divvy-sync ok rows_changed=${plan.upserts.length} stations=${plan.stationsInFeed} ` +
         `skipped_without_info=${plan.skippedWithoutInfo} feed_last_updated=${plan.feedLastUpdated} ` +
-        `ms=${Date.now() - startedAt.getTime()}`,
+        `ms=${Date.now() - startedAt.getTime()} fields=${JSON.stringify(plan.changedFields)}`,
     );
     return json({ ok: true, rows_changed: plan.upserts.length, feed_last_updated: plan.feedLastUpdated });
   } catch (e) {

@@ -57,6 +57,11 @@ export type StationRow = {
 // A station that hasn't reported for this long is flagged inactive.
 export const INACTIVE_AFTER_SECONDS = 24 * 60 * 60;
 
+// Coordinates are rounded to 6 decimals (~11 cm). Some feed values have 16-17
+// significant digits, and PostgREST returns double precision with 15, so
+// unrounded they never compare equal and 148 stations were rewritten every run.
+const roundCoord = (x: number) => Math.round(x * 1e6) / 1e6;
+
 // What counts as a change: counts, flags and the station's info.
 // last_reported is deliberately absent: about 750 stations bump it every
 // minute with nothing else different (see docs/source.md).
@@ -81,6 +86,7 @@ export type ComparedRow = Pick<StationRow, "station_id" | (typeof COMPARED_FIELD
 
 export type RunPlan = {
   upserts: StationRow[];
+  changedFields: Record<string, number>;
   feedLastUpdated: string;
   stationsInFeed: number;
   skippedWithoutInfo: number;
@@ -115,8 +121,8 @@ export function buildRows(status: GbfsStatus, info: GbfsInfo): { rows: StationRo
       station_id: s.station_id,
       name: i.name,
       short_name: i.short_name ?? null,
-      lat: i.lat,
-      lon: i.lon,
+      lat: roundCoord(i.lat),
+      lon: roundCoord(i.lon),
       capacity: i.capacity ?? null,
       num_bikes_available: s.num_bikes_available,
       num_ebikes_available: s.num_ebikes_available ?? 0,
@@ -145,13 +151,30 @@ export function diffStations(current: ComparedRow[], next: StationRow[]): Statio
   return next.filter((row) => hasChanged(byId.get(row.station_id), row));
 }
 
+// How many saved rows differ in each field, for the run's log line.
+export function changedFieldCounts(current: ComparedRow[], upserts: StationRow[]): Record<string, number> {
+  const byId = new Map(current.map((r) => [r.station_id, r]));
+  const counts: Record<string, number> = {};
+  for (const row of upserts) {
+    const previous = byId.get(row.station_id);
+    if (!previous) {
+      counts.new = (counts.new ?? 0) + 1;
+      continue;
+    }
+    for (const f of COMPARED_FIELDS) if (previous[f] !== row[f]) counts[f] = (counts[f] ?? 0) + 1;
+  }
+  return counts;
+}
+
 // The whole decision for one run: given what's in the table and the two feed
 // responses, which rows to upsert and what to record in runs.
 export function planRun(current: ComparedRow[], status: unknown, info: unknown): RunPlan {
   assertFeeds(status, info);
   const { rows, skippedWithoutInfo } = buildRows(status, info as GbfsInfo);
+  const upserts = diffStations(current, rows);
   return {
-    upserts: diffStations(current, rows),
+    upserts,
+    changedFields: changedFieldCounts(current, upserts),
     feedLastUpdated: new Date(status.last_updated * 1000).toISOString(),
     stationsInFeed: status.data.stations.length,
     skippedWithoutInfo,

@@ -36,6 +36,7 @@ test("saves only stations whose counts changed, plus new ones", () => {
   assert.equal(plan.stationsInFeed, 7);
   assert.equal(plan.skippedWithoutInfo, 1);
   assert.equal(plan.feedLastUpdated, "2026-11-03T21:21:41.000Z");
+  assert.deepEqual(plan.changedFields, { new: 1, num_bikes_available: 2, num_ebikes_available: 2 });
 });
 
 test("saved rows carry the new values from the feed", () => {
@@ -83,6 +84,19 @@ test("a station is flagged inactive once, when it passes 24 h without reporting"
   const current = buildRows(after, info).rows;
   const flipped = planRun(current, dayLater, info).upserts.find((r) => r.station_id === SHIELDS);
   assert.equal(flipped?.is_reporting, false);
+});
+
+test("coordinates survive the database round trip, so they don't look changed every run", () => {
+  // 63rd St Beach's real latitude has 17 significant digits; PostgREST sends
+  // double precision back with 15 ("41.780910964248").
+  const withLongCoords: GbfsInfo = structuredClone(info);
+  withLongCoords.data.stations.find((i) => i.station_id === SHIELDS)!.lat = 41.78091096424799;
+
+  const saved = buildRows(after, withLongCoords).rows;
+  const roundTripped = saved.map((r) => ({ ...r, lat: Number(r.lat.toPrecision(15)), lon: Number(r.lon.toPrecision(15)) }));
+
+  assert.equal(saved.find((r) => r.station_id === SHIELDS)!.lat, 41.780911);
+  assert.deepEqual(planRun(roundTripped, after, withLongCoords).upserts, []);
 });
 
 test("a station missing from station_information is skipped, not saved nameless", () => {
