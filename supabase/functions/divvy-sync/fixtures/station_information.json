@@ -1,0 +1,87 @@
+{
+  "data": {
+    "stations": [
+      {
+        "station_id": "a3ad13e4-a135-11e9-9cda-0a87ae2ba916",
+        "name": "Shields Ave & 28th Pl",
+        "short_name": "CHI00514",
+        "lon": -87.635491,
+        "lat": 41.842733,
+        "capacity": 11,
+        "rental_uris": {
+          "android": "https://chi.lft.to/lastmile_qr_scan",
+          "ios": "https://chi.lft.to/lastmile_qr_scan"
+        },
+        "is_charging": false
+      },
+      {
+        "station_id": "a3a3b202-a135-11e9-9cda-0a87ae2ba916",
+        "name": "Paulina Ave & North Ave",
+        "short_name": "CHI00258",
+        "lon": -87.66993016004562,
+        "lat": 41.90985465216731,
+        "capacity": 15,
+        "rental_uris": {
+          "android": "https://chi.lft.to/lastmile_qr_scan",
+          "ios": "https://chi.lft.to/lastmile_qr_scan"
+        },
+        "is_charging": false
+      },
+      {
+        "station_id": "1850868044363584392",
+        "name": "University Ave & 59th St",
+        "short_name": "CHI01913",
+        "lon": -87.598906,
+        "lat": 41.787878,
+        "capacity": 15,
+        "rental_uris": {
+          "android": "https://chi.lft.to/lastmile_qr_scan",
+          "ios": "https://chi.lft.to/lastmile_qr_scan"
+        },
+        "is_charging": false
+      },
+      {
+        "station_id": "a3ab9119-a135-11e9-9cda-0a87ae2ba916",
+        "name": "Ravenswood Ave & Lawrence Ave",
+        "short_name": "CHI00508",
+        "lon": -87.674226,
+        "lat": 41.968445,
+        "capacity": 47,
+        "rental_uris": {
+          "android": "https://chi.lft.to/lastmile_qr_scan",
+          "ios": "https://chi.lft.to/lastmile_qr_scan"
+        },
+        "is_charging": false
+      },
+      {
+        "station_id": "a3b0fae6-a135-11e9-9cda-0a87ae2ba916",
+        "name": "Glenwood Ave & Touhy Ave",
+        "short_name": "CHI01143",
+        "lon": -87.666058,
+        "lat": 42.012701,
+        "capacity": 15,
+        "rental_uris": {
+          "android": "https://chi.lft.to/lastmile_qr_scan",
+          "ios": "https://chi.lft.to/lastmile_qr_scan"
+        },
+        "is_charging": false
+      },
+      {
+        "station_id": "a3acb1de-a135-11e9-9cda-0a87ae2ba916",
+        "name": "California Ave & Lake St",
+        "short_name": "CHI00650",
+        "lon": -87.6962981368,
+        "lat": 41.88445395657,
+        "capacity": 11,
+        "rental_uris": {
+          "android": "https://chi.lft.to/lastmile_qr_scan",
+          "ios": "https://chi.lft.to/lastmile_qr_scan"
+        },
+        "is_charging": false
+      }
+    ]
+  },
+  "last_updated": 1793740840,
+  "ttl": 60,
+  "version": "2.3"
+}
