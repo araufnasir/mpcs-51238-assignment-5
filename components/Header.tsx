@@ -18,6 +18,7 @@ export function Header() {
             <nav className="flex items-center gap-1">
               <NavLink href="/watchlist">Watchlist</NavLink>
               <NavLink href="/search">Search</NavLink>
+              <NavLink href="/live">Live</NavLink>
               <div className="ml-2 flex">
                 <UserButton />
               </div>
