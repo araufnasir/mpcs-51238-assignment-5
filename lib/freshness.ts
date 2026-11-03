@@ -15,11 +15,15 @@ export type ChannelStatus = "CONNECTING" | "SUBSCRIBED" | "TIMED_OUT" | "CLOSED"
 export type Freshness =
   | { kind: "loading" }
   | { kind: "fresh" }
-  | { kind: "stale"; which: "worker" | "feed" }
+  | { kind: "stale"; which: "connection" | "worker" | "feed" }
   | { kind: "down" };
 
 // "Stale" = about three missed 60 s runs, on either clock.
 export const STALE_AFTER_MS = 3 * 60 * 1000;
+
+// The Realtime channel ended; LiveStations is resubscribing and polling.
+export const isChannelDown = (status: ChannelStatus) =>
+  status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED";
 
 // The two clocks: the worker's last successful run, and the feed's own
 // last_updated as seen by that run. null until the page knows the time.
@@ -42,6 +46,8 @@ export function freshnessState({
   feedAge: number | null;
 }): Freshness {
   if (latestRun && !latestRun.ok) return { kind: "down" };
+  // Without the channel the clocks only move when polled, so don't blame the worker.
+  if (isChannelDown(channelStatus)) return { kind: "stale", which: "connection" };
   if (channelStatus === "CONNECTING" || workerAge === null) return { kind: "loading" };
   // feed_last_updated is never newer than the run that saw it, so a stopped
   // worker always ages both clocks. Blame the worker then; "feed" means the
@@ -58,6 +64,7 @@ export function freshnessReason(
 ): string | null {
   if (state.kind === "stale") {
     return {
+      connection: "Live connection lost. Showing data from the last successful update",
       worker: `The worker hasn't finished a run for ${formatAge(workerAge)}, so Divvy's latest data isn't reaching this page.`,
       feed: `Divvy hasn't published new data for ${formatAge(feedAge)}; the worker is still running.`,
     }[state.which];

@@ -62,6 +62,28 @@ test("stale, feed: the worker runs every minute but Divvy stopped publishing", (
   assert.equal(reason, "Divvy hasn't published new data for 10 min; the worker is still running.");
 });
 
+test("stale, connection: a lost Realtime channel is named, not the worker", () => {
+  // The page has had no events for 6 min, so the worker clock looks old, but the worker may be fine.
+  const last = run({ finished_at: ago(6 * 60_000), feed_last_updated: ago(7 * 60_000) });
+  for (const status of ["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"] as const) {
+    const ages = clockAges(last, NOW);
+    const state = freshnessState({ channelStatus: status, latestRun: last, ...ages });
+    assert.deepEqual(state, { kind: "stale", which: "connection" });
+    assert.equal(
+      freshnessReason(state, { latestRun: last, ...ages, now: NOW }),
+      "Live connection lost. Showing data from the last successful update",
+    );
+  }
+  // Even with fresh clocks (kept current by polling), a lost channel is still reported.
+  const fresh = clockAges(run(), NOW);
+  assert.deepEqual(freshnessState({ channelStatus: "CLOSED", latestRun: run(), ...fresh }), { kind: "stale", which: "connection" });
+});
+
+test("a failed run still shows down while the channel is lost", () => {
+  const failed = run({ ok: false, error: "timeout" });
+  assert.deepEqual(freshnessState({ channelStatus: "CLOSED", latestRun: failed, ...clockAges(run(), NOW) }), { kind: "down" });
+});
+
 test("down when the latest run failed, even if the last success was recent", () => {
   const ok = run({ id: 1 });
   const failed = run({ id: 2, ok: false, finished_at: ago(30_000), feed_last_updated: null, error: "GET station_status: HTTP 503" });

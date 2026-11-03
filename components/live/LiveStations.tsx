@@ -1,6 +1,7 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { useEffect, useMemo, useState } from "react";
 import { FollowButton } from "./FollowButton";
 import {
@@ -9,6 +10,7 @@ import {
   formatAge,
   freshnessReason,
   freshnessState,
+  isChannelDown,
   type ChannelStatus,
   type Freshness,
   type Run,
@@ -31,6 +33,14 @@ export type LiveStation = {
 
 type LastEvent = { table: string; type: string; at: number; detail: string };
 
+const STATION_COLUMNS =
+  "station_id, name, num_bikes_available, num_ebikes_available, num_docks_available, is_renting, is_reporting, last_reported, updated_at";
+const RUN_COLUMNS = "id, finished_at, ok, rows_changed, feed_last_updated, error";
+// Resubscribe after 2 s, 4 s, 8 s … up to 30 s; poll every 30 s while not subscribed.
+const RETRY_START_MS = 2_000;
+const RETRY_MAX_MS = 30_000;
+const POLL_MS = 30_000;
+
 export function LiveStations({
   initialStations,
   latestRun: initialLatestRun,
@@ -50,11 +60,9 @@ export function LiveStations({
   const [now, setNow] = useState<number | null>(null);
 
   // The parent remounts this component (key) when follows change, so the
-  // subscription's filter is fixed for its lifetime.
-  const stationFilter = useMemo(
-    () => `station_id=in.(${initialStations.map((s) => s.station_id).join(",")})`,
-    [initialStations],
-  );
+  // followed IDs are fixed for its lifetime. A string, so a re-render of the
+  // server page (new array, same IDs) doesn't restart the effects below.
+  const stationIds = initialStations.map((s) => s.station_id).join(",");
 
   useEffect(() => {
     const tick = () => setNow(Date.now());
@@ -66,47 +74,105 @@ export function LiveStations({
     };
   }, []);
 
+  // One client for the subscription and the fallback polling.
+  const supabase = useMemo(() => createBrowserSupabaseClient(() => getToken()), [getToken]);
+  const subscribed = channelStatus === "SUBSCRIBED";
+
   useEffect(() => {
     if (!isSignedIn) return;
-    const supabase = createBrowserSupabaseClient(() => getToken());
-    const channel = supabase.channel("live-stations");
+    let channel: RealtimeChannel | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let delay = RETRY_START_MS;
+    let stopped = false;
 
-    if (initialStations.length > 0) {
-      channel.on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "stations", filter: stationFilter },
-        (payload) => {
-          const row = payload.new as LiveStation;
-          if (!row?.station_id) return;
-          setStations((prev) => prev.map((s) => (s.station_id === row.station_id ? { ...s, ...row } : s)));
-          setLastEvent({ table: "stations", type: payload.eventType, at: Date.now(), detail: row.name });
-        },
-      );
+    // When the channel ends, drop it and subscribe again later with a fresh token.
+    function retry(ended: RealtimeChannel) {
+      if (stopped || ended !== channel || retryTimer) return;
+      channel = null;
+      supabase.removeChannel(ended);
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        connect();
+      }, delay);
+      delay = Math.min(delay * 2, RETRY_MAX_MS);
     }
-    channel
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "runs" }, (payload) => {
+
+    async function connect() {
+      await supabase.realtime.setAuth().catch(() => {});
+      if (stopped) return;
+      // Each attempt gets its own topic, because channel() reuses an existing one.
+      const ch = supabase.channel(`live-stations-${Date.now()}`);
+      channel = ch;
+
+      if (stationIds) {
+        ch.on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "stations", filter: `station_id=in.(${stationIds})` },
+          (payload) => {
+            const row = payload.new as LiveStation;
+            if (!row?.station_id) return;
+            setStations((prev) => prev.map((s) => (s.station_id === row.station_id ? { ...s, ...row } : s)));
+            setLastEvent({ table: "stations", type: payload.eventType, at: Date.now(), detail: row.name });
+          },
+        );
+      }
+      ch.on("postgres_changes", { event: "INSERT", schema: "public", table: "runs" }, (payload) => {
         const run = payload.new as Run;
         setRuns((prev) => applyRun(prev, run));
-        setLastEvent({
-          table: "runs",
-          type: "INSERT",
-          at: Date.now(),
-          detail: run.ok ? `ok, ${run.rows_changed} rows` : "failed",
-        });
-      })
-      .subscribe((status) => setChannelStatus(status as ChannelStatus));
+        setLastEvent({ table: "runs", type: "INSERT", at: Date.now(), detail: run.ok ? `ok, ${run.rows_changed} rows` : "failed" });
+      }).subscribe((status) => {
+        // Ignore the CLOSED that removeChannel reports for a channel already replaced.
+        if (stopped || ch !== channel) return;
+        if (status === "SUBSCRIBED") delay = RETRY_START_MS;
+        setChannelStatus(status as ChannelStatus);
+        if (isChannelDown(status as ChannelStatus)) retry(ch);
+      });
+    }
 
+    connect();
     return () => {
-      supabase.removeChannel(channel);
+      stopped = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (channel) supabase.removeChannel(channel);
     };
-  }, [isSignedIn, getToken, stationFilter, initialStations.length]);
+  }, [isSignedIn, supabase, stationIds]);
+
+  // While the channel isn't subscribed, poll so counts and clocks stay correct.
+  useEffect(() => {
+    if (!isSignedIn || subscribed) return;
+    const ids = stationIds ? stationIds.split(",") : [];
+    let cancelled = false;
+    const poll = async () => {
+      const [latest, lastOk, rows] = await Promise.all([
+        supabase.from("runs").select(RUN_COLUMNS).order("id", { ascending: false }).limit(1).maybeSingle(),
+        supabase.from("runs").select(RUN_COLUMNS).eq("ok", true).order("id", { ascending: false }).limit(1).maybeSingle(),
+        ids.length > 0 ? supabase.from("stations").select(STATION_COLUMNS).in("station_id", ids) : null,
+      ]);
+      if (cancelled) return;
+      if (!latest.error && !lastOk.error) {
+        setRuns((prev) => ({
+          latestRun: (latest.data as Run | null) ?? prev.latestRun,
+          lastOkRun: (lastOk.data as Run | null) ?? prev.lastOkRun,
+        }));
+      }
+      if (rows && !rows.error) {
+        const byId = new Map((rows.data as LiveStation[]).map((r) => [r.station_id, r]));
+        setStations((prev) => prev.map((s) => byId.get(s.station_id) ?? s));
+      }
+    };
+    const timer = setInterval(poll, POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [isSignedIn, subscribed, supabase, stationIds]);
 
   const { workerAge, feedAge } = clockAges(lastOkRun, now);
   const state = freshnessState({ channelStatus, latestRun, workerAge, feedAge });
 
   return (
     <section aria-labelledby="following-heading" className="space-y-4">
-      <FreshnessBanner state={state} channelStatus={channelStatus} latestRun={latestRun} workerAge={workerAge} feedAge={feedAge} now={now} />
+      <FreshnessBanner state={state} latestRun={latestRun} workerAge={workerAge} feedAge={feedAge} now={now} />
 
       <h2 id="following-heading" className="text-lg font-semibold">
         Following ({stations.length}/50)
@@ -141,14 +207,12 @@ const BANNER = {
 
 function FreshnessBanner({
   state,
-  channelStatus,
   latestRun,
   workerAge,
   feedAge,
   now,
 }: {
   state: Freshness;
-  channelStatus: ChannelStatus;
   latestRun: Run | null;
   workerAge: number | null;
   feedAge: number | null;
@@ -156,7 +220,6 @@ function FreshnessBanner({
 }) {
   const b = BANNER[state.kind];
   const reason = freshnessReason(state, { latestRun, workerAge, feedAge, now });
-  const disconnected = channelStatus === "CHANNEL_ERROR" || channelStatus === "TIMED_OUT" || channelStatus === "CLOSED";
 
   return (
     <div className={`rounded-xl border p-4 ${b.colors}`}>
@@ -166,9 +229,6 @@ function FreshnessBanner({
         <div>
           <p className="font-semibold">{b.title}</p>
           {reason && <p className="mt-0.5 text-sm text-zinc-700 dark:text-zinc-300">{reason}</p>}
-          {disconnected && (
-            <p className="mt-0.5 text-sm text-zinc-700 dark:text-zinc-300">Live connection lost; reconnecting…</p>
-          )}
         </div>
       </div>
       <dl className="mt-3 grid grid-cols-2 gap-2 text-sm">
