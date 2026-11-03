@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Weather Watchlist",
-  description: "Save cities and see their current weather.",
+  title: "Live Divvy",
+  description: "Follow Divvy bike stations and watch bike and dock counts update live.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

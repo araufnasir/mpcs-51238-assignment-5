@@ -9,16 +9,16 @@ export function Header() {
     <header className="border-b border-zinc-200 dark:border-zinc-800">
       <div className="mx-auto flex h-14 w-full max-w-2xl items-center justify-between gap-4 px-4">
         <Link href="/" className="font-semibold">
-          <span aria-hidden>🌤️</span> Weather Watchlist
+          <span aria-hidden>🚲</span> Live Divvy
         </Link>
 
         {/* Auth state is per request, so it streams in behind this boundary. */}
         <Suspense fallback={<div className="h-8 w-8" />}>
           <Show when="signed-in">
             <nav className="flex items-center gap-1">
-              <NavLink href="/watchlist">Watchlist</NavLink>
-              <NavLink href="/search">Search</NavLink>
               <NavLink href="/live">Live</NavLink>
+              <NavLink href="/watchlist">Weather</NavLink>
+              <NavLink href="/search">Search</NavLink>
               <div className="ml-2 flex">
                 <UserButton />
               </div>
