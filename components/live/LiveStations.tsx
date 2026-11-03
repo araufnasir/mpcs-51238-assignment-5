@@ -3,7 +3,19 @@
 import { useAuth } from "@clerk/nextjs";
 import { useEffect, useMemo, useState } from "react";
 import { FollowButton } from "./FollowButton";
+import {
+  applyRun,
+  clockAges,
+  formatAge,
+  freshnessReason,
+  freshnessState,
+  type ChannelStatus,
+  type Freshness,
+  type Run,
+} from "@/lib/freshness";
 import { createBrowserSupabaseClient } from "@/lib/supabase/browser";
+
+export type { Run };
 
 export type LiveStation = {
   station_id: string;
@@ -17,19 +29,6 @@ export type LiveStation = {
   updated_at: string;
 };
 
-export type Run = {
-  id: number;
-  finished_at: string;
-  ok: boolean;
-  rows_changed: number;
-  feed_last_updated: string | null;
-  error: string | null;
-};
-
-// "Stale" = about three missed 60 s runs, on either clock.
-const STALE_AFTER_MS = 3 * 60 * 1000;
-
-type ChannelStatus = "CONNECTING" | "SUBSCRIBED" | "TIMED_OUT" | "CLOSED" | "CHANNEL_ERROR";
 type LastEvent = { table: string; type: string; at: number; detail: string };
 
 export function LiveStations({
@@ -43,8 +42,8 @@ export function LiveStations({
 }) {
   const { getToken, isSignedIn } = useAuth();
   const [stations, setStations] = useState(initialStations);
-  const [latestRun, setLatestRun] = useState(initialLatestRun);
-  const [lastOkRun, setLastOkRun] = useState(initialLastOkRun);
+  const [runs, setRuns] = useState({ latestRun: initialLatestRun, lastOkRun: initialLastOkRun });
+  const { latestRun, lastOkRun } = runs;
   const [channelStatus, setChannelStatus] = useState<ChannelStatus>("CONNECTING");
   const [lastEvent, setLastEvent] = useState<LastEvent | null>(null);
   // null until mounted, so server and client render the same markup.
@@ -87,8 +86,7 @@ export function LiveStations({
     channel
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "runs" }, (payload) => {
         const run = payload.new as Run;
-        setLatestRun(run);
-        if (run.ok) setLastOkRun(run);
+        setRuns((prev) => applyRun(prev, run));
         setLastEvent({
           table: "runs",
           type: "INSERT",
@@ -103,8 +101,7 @@ export function LiveStations({
     };
   }, [isSignedIn, getToken, stationFilter, initialStations.length]);
 
-  const workerAge = now !== null && lastOkRun ? now - Date.parse(lastOkRun.finished_at) : null;
-  const feedAge = now !== null && lastOkRun?.feed_last_updated ? now - Date.parse(lastOkRun.feed_last_updated) : null;
+  const { workerAge, feedAge } = clockAges(lastOkRun, now);
   const state = freshnessState({ channelStatus, latestRun, workerAge, feedAge });
 
   return (
@@ -135,33 +132,6 @@ export function LiveStations({
   );
 }
 
-type Freshness =
-  | { kind: "loading" }
-  | { kind: "fresh" }
-  | { kind: "stale"; which: "worker" | "feed" | "both" }
-  | { kind: "down" };
-
-function freshnessState({
-  channelStatus,
-  latestRun,
-  workerAge,
-  feedAge,
-}: {
-  channelStatus: ChannelStatus;
-  latestRun: Run | null;
-  workerAge: number | null;
-  feedAge: number | null;
-}): Freshness {
-  if (latestRun && !latestRun.ok) return { kind: "down" };
-  if (channelStatus === "CONNECTING" || workerAge === null) return { kind: "loading" };
-  const workerStale = workerAge > STALE_AFTER_MS;
-  const feedStale = feedAge === null || feedAge > STALE_AFTER_MS;
-  if (workerStale && feedStale) return { kind: "stale", which: "both" };
-  if (workerStale) return { kind: "stale", which: "worker" };
-  if (feedStale) return { kind: "stale", which: "feed" };
-  return { kind: "fresh" };
-}
-
 const BANNER = {
   loading: { icon: "⏳", title: "Connecting to live updates…", colors: "border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900" },
   fresh: { icon: "✅", title: "Live", colors: "border-emerald-300 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/40" },
@@ -185,16 +155,7 @@ function FreshnessBanner({
   now: number | null;
 }) {
   const b = BANNER[state.kind];
-  let reason: string | null = null;
-  if (state.kind === "stale") {
-    reason = {
-      worker: `The worker hasn't finished a run for ${formatAge(workerAge)}.`,
-      feed: `Divvy hasn't published new data for ${formatAge(feedAge)}; the worker is still running.`,
-      both: `The worker hasn't run for ${formatAge(workerAge)} and Divvy's data is ${formatAge(feedAge)} old.`,
-    }[state.which];
-  } else if (state.kind === "down" && latestRun && now !== null) {
-    reason = `The last run failed ${formatAge(now - Date.parse(latestRun.finished_at))} ago: ${latestRun.error ?? "unknown error"}. Showing the last known counts.`;
-  }
+  const reason = freshnessReason(state, { latestRun, workerAge, feedAge, now });
   const disconnected = channelStatus === "CHANNEL_ERROR" || channelStatus === "TIMED_OUT" || channelStatus === "CLOSED";
 
   return (
@@ -269,15 +230,4 @@ function DevRealtimeIndicator({ channelStatus, lastEvent, now }: { channelStatus
       </div>
     </aside>
   );
-}
-
-function formatAge(ms: number | null): string {
-  if (ms === null) return "—";
-  const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 90) return `${s} s`;
-  const m = Math.round(s / 60);
-  if (m < 90) return `${m} min`;
-  const h = Math.round(m / 60);
-  if (h < 48) return `${h} h`;
-  return `${Math.round(h / 24)} days`;
 }
