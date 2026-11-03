@@ -4,6 +4,44 @@ A small web app for keeping an eye on the weather in the cities you care about. 
 
 Built for MPCS 51238 Assignment 4 with Next.js 16, Clerk, Supabase and [Open-Meteo](https://open-meteo.com/).
 
+## Assignment 5: live Divvy stations (`/live`)
+
+Signed-in users follow Divvy bike stations and watch their bike and dock counts update without refreshing. A Supabase Edge Function, called by Supabase Cron every 60 seconds, pulls Divvy's public GBFS feed and saves only the stations that changed. Supabase Realtime pushes those changes to the page. The weather watchlist below still works as before.
+
+Every 60 seconds because the feed refreshes every 60 s: `station_status` advertises `ttl: 60`, and its `last_updated` moved by about 60 s on every fetch. Polling faster re-reads the same snapshot, and polling slower skips some. That is 43,200 function calls a month, about 9% of the free 500,000.
+
+```mermaid
+flowchart LR
+    DIVVY["Divvy GBFS (Lyft)<br/>station_status: ttl 60 s<br/>station_information: names"]
+
+    subgraph Supabase
+        VAULT[("Vault")]
+        CRON["Supabase Cron<br/>every 60 s"]
+        EF["Edge Function<br/>divvy-sync<br/>pure core: diff()"]
+        ST[("stations<br/>read: signed-in users<br/>write: worker only")]
+        RUNS[("runs<br/>one row per run")]
+        FOL[("followed_stations<br/>RLS: user_id = Clerk sub")]
+        RT["Realtime"]
+    end
+
+    NX["Next.js on Vercel<br/>/live first render<br/>follow / unfollow"]
+    BR["Browser /live<br/>freshness + 4 states"]
+
+    VAULT -. "secret by name" .-> CRON
+    CRON -- "1 POST, Authorization from Vault" --> EF
+    DIVVY -- "2 JSON: stations[], last_updated,<br/>names, lat/lon, capacity" --> EF
+    EF -- "3-4 read current, upsert<br/>ONLY changed rows (~80/min)" --> ST
+    EF -- "5 insert: when, ok, rows_changed,<br/>feed_last_updated, error" --> RUNS
+    ST -- "6 UPDATE/INSERT events" --> RT
+    RUNS -- "6 INSERT events" --> RT
+    RT -- "7 my followed stations only<br/>+ new runs, RLS via Clerk JWT" --> BR
+    BR -- "follow / unfollow (Clerk JWT)" --> NX
+    NX -- "insert / delete my row" --> FOL
+    NX -- "my follows + stations + latest run" --> BR
+```
+
+Details: what each hop sends, the freshness rules, the four page states and the Realtime volume estimate are in [`docs/data-flow.md`](docs/data-flow.md). The source measurements are in [`docs/source.md`](docs/source.md).
+
 ## Data model
 
 One table, `public.saved_cities`. Each row belongs to exactly one person: `user_id` is their Clerk user ID, filled in from their session token.
