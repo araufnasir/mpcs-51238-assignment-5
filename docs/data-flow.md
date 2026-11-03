@@ -9,7 +9,7 @@ flowchart LR
     subgraph Supabase
         VAULT[("Vault")]
         CRON["Supabase Cron<br/>every 60 s"]
-        EF["Edge Function<br/>divvy-sync<br/>pure core: diff()"]
+        EF["Edge Function<br/>divvy-sync<br/>pure core: planRun()"]
         ST[("stations<br/>read: signed-in users<br/>write: worker only")]
         RUNS[("runs<br/>one row per run")]
         FOL[("followed_stations<br/>RLS: user_id = Clerk sub")]
@@ -20,7 +20,7 @@ flowchart LR
     BR["Browser /live<br/>freshness + 4 states"]
 
     VAULT -. "secret by name" .-> CRON
-    CRON -- "1 POST, Authorization from Vault" --> EF
+    CRON -- "1 POST + x-divvy-sync-secret" --> EF
     DIVVY -- "2 JSON: stations[], last_updated,<br/>names, lat/lon, capacity" --> EF
     EF -- "3-4 read current, upsert<br/>ONLY changed rows (~80/min)" --> ST
     EF -- "5 insert: when, ok, rows_changed,<br/>feed_last_updated, error" --> RUNS
@@ -36,7 +36,7 @@ flowchart LR
 
 | # | from → to | payload |
 |---|-----------|---------|
-| 1 | Cron → Edge Function (pg_cron + pg_net) | HTTPS POST, empty body. The `Authorization` header is read from Vault **by name** at call time, so no key is in the migration or the repo. |
+| 1 | Cron → Edge Function (pg_cron + pg_net) | HTTPS POST, empty body, with header `x-divvy-sync-secret`. The value is read from Vault **by name** at call time, so no key is in the migration or the repo. The function checks it with `divvy_sync_secret_ok()` and answers 401 if it is missing or wrong. |
 | 2 | Edge Function → Divvy | Two GETs. `station_status` gives counts, flags, per-station `last_reported` and the feed's `last_updated`. `station_information` gives `name`, `lat`, `lon`, `capacity`. |
 | 3 | Edge Function → `stations` | Selects the comparable columns of every station, to diff against. Uses the secret key Supabase injects into the function's environment, never one in code. |
 | 4 | Edge Function → `stations` | Upserts on `station_id` **only for stations whose counts or flags changed**. `last_reported` alone doesn't count as a change (see `source.md`: about 750 heartbeat bumps a minute, about 80 real changes). |
@@ -56,7 +56,7 @@ The page shows both:
 |-------|-----------|--------------------|
 | **loading** | first data or the subscription isn't ready yet | skeleton cards, "Connecting…" |
 | **fresh** | latest run `ok`, `finished_at` ≤ 3 min ago, feed `last_updated` ≤ 3 min ago | normal cards, "updated N s ago" |
-| **stale** | latest successful run > 3 min ago (about 3 missed runs) **or** feed `last_updated` > 3 min ago while the worker is fine | cards dimmed, a banner naming which clock is behind: "worker hasn't run for 5 min" vs "Divvy hasn't published new data for 5 min" |
+| **stale** | either clock is over 3 minutes (about 3 missed runs) | cards dimmed, a banner naming one cause. If the worker clock is behind, it names the **worker**: a stopped worker ages both clocks, because the feed time is only seen through runs. Otherwise it names **Divvy** ("hasn't published new data…; the worker is still running"). |
 | **down** | latest run has `ok = false` | banner with the run time and its `error`. The last known counts stay visible, labelled with their age. |
 
 Each state has a text label and an icon, not just a colour, and changes are announced through `aria-live="polite"`.
